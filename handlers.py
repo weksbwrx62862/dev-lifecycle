@@ -294,6 +294,9 @@ def handle_dev_workflow(args: Dict[str, Any], **kwargs) -> str:
             return _handle_resume(project_path)
         elif action == "report":
             return _handle_report()
+        elif action == "kanban":
+            project_path = args.get("project_path", "")
+            return _handle_kanban(project_path)
         else:
             return json.dumps({"error": f"未知 action: {action}"})
     except Exception as e:
@@ -639,6 +642,45 @@ def _handle_report() -> str:
             logger.debug("self-evolution 提交失败（非致命）: %s", e)
 
     return json.dumps(report, ensure_ascii=False, indent=2)
+
+
+def _handle_kanban(project_path: str = "") -> str:
+    """生成看板视图。"""
+    try:
+        from .kanban import create_dev_lifecycle_kanban, add_task_to_kanban, get_kanban_stats, render_kanban_html
+        
+        # 创建看板
+        board = create_dev_lifecycle_kanban("Hermes 项目")
+        
+        # 添加示例任务（实际应从项目状态加载）
+        add_task_to_kanban(board, "ideate", "req-1", "需求分析", "分析用户需求", "high", ["需求"])
+        add_task_to_kanban(board, "ideate", "plan-1", "架构设计", "设计系统架构", "medium", ["设计"])
+        add_task_to_kanban(board, "build", "impl-1", "代码实现", "实现核心功能", "high", ["开发"])
+        add_task_to_kanban(board, "build", "test-1", "单元测试", "编写单元测试", "medium", ["测试"])
+        add_task_to_kanban(board, "deliver", "deploy-1", "部署上线", "部署到生产环境", "critical", ["运维"])
+        
+        # 获取统计
+        stats = get_kanban_stats(board)
+        
+        # 生成 HTML
+        html = render_kanban_html(board)
+        kanban_path = f"/tmp/kanban_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+        with open(kanban_path, "w", encoding="utf-8") as f:
+            f.write(html)
+        
+        return json.dumps({
+            "success": True,
+            "kanban_path": kanban_path,
+            "stats": stats,
+            "message": f"看板已生成: {kanban_path}",
+        }, ensure_ascii=False, indent=2)
+        
+    except Exception as e:
+        logger.error("生成看板失败: %s", e)
+        return json.dumps({
+            "success": False,
+            "error": str(e),
+        }, ensure_ascii=False)
 
 
 def _get_workflow_id(project_path: str) -> Optional[int]:
