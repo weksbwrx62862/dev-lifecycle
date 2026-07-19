@@ -111,3 +111,46 @@ class QualityGateManager:
             failures=failures,
             suggestions=suggestions,
         )
+
+
+# ── 角色边界（RoleBoundary）──────────────────────────────────────────────────
+
+
+@dataclass
+class RoleBoundary:
+    """技能角色边界约束（借鉴 gstack 设计哲学）。
+
+    软约束：提示性，不强制阻断执行。
+    """
+    skill_name: str
+    allowed: list[str] = field(default_factory=list)
+    forbidden: list[str] = field(default_factory=list)
+    rationale: str = ""
+
+
+# 角色边界注册表
+ROLE_BOUNDARIES: dict[str, RoleBoundary] = {
+    "requesting-code-review": RoleBoundary(
+        skill_name="requesting-code-review",
+        allowed=["报告发现的 bug", "提供修复建议", "评估代码质量"],
+        forbidden=["修复发现的 bug", "直接修改被审查的代码"],
+        rationale="reviewer 修 bug 会破坏客观判断",
+    ),
+    "systematic-debugging": RoleBoundary(
+        skill_name="systematic-debugging",
+        allowed=["提出假设", "设计验证实验", "收集证据"],
+        forbidden=["跳过假设验证步骤", "盲目修改代码"],
+        rationale="跳过假设验证会导致误判根因",
+    ),
+    "test-driven-development": RoleBoundary(
+        skill_name="test-driven-development",
+        allowed=["先写测试", "运行测试看红", "写最小实现", "重构"],
+        forbidden=["先写实现再补测试", "跳过红绿重构循环"],
+        rationale="先实现后测试会偏离 TDD 纪律",
+    ),
+}
+
+
+def get_role_boundary(skill_name: str) -> "RoleBoundary | None":
+    """查询技能的角色边界，未定义返回 None。"""
+    return ROLE_BOUNDARIES.get(skill_name)

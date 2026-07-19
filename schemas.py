@@ -1,5 +1,13 @@
 """dev-lifecycle 插件 — 工具 schema 定义。"""
 
+from typing import Any, Dict
+
+try:
+    from .gates import get_role_boundary, RoleBoundary
+except ImportError:
+    from gates import get_role_boundary, RoleBoundary
+
+
 DEV_WORKFLOW_SCHEMA = {
     "name": "dev_workflow",
     "description": (
@@ -26,7 +34,7 @@ DEV_WORKFLOW_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["overview", "stage", "skill", "start", "advance", "rollback", "resume", "report"],
+                "enum": ["overview", "stage", "skill", "start", "advance", "rollback", "resume", "report", "kanban"],
                 "description": (
                     "操作类型：\n"
                     "- overview: 列出所有阶段和包含的技能\n"
@@ -36,7 +44,8 @@ DEV_WORKFLOW_SCHEMA = {
                     "- advance: 推进到下一个技能（需指定 skill_name）\n"
                     "- rollback: 回退到指定阶段（需指定 to_stage）\n"
                     "- resume: 恢复已有项目的生命周期（需指定 project_path）\n"
-                    "- report: 生成当前项目进度报告"
+                    "- report: 生成当前项目进度报告\n"
+                    "- kanban: 生成看板视图（可指定 project_path）"
                 ),
             },
             "stage_name": {
@@ -87,3 +96,26 @@ DEV_WORKFLOW_SCHEMA = {
         ],
     },
 }
+
+
+# ── 角色边界辅助函数 ────────────────────────────────────────────
+
+
+def enrich_skill_with_role_boundary(skill_info: Dict[str, Any]) -> Dict[str, Any]:
+    """为技能信息字典补充 role_boundary 字段。
+
+    根据 skill_info 中的 name 或 skill_name 字段查询 ROLE_BOUNDARIES 注册表，
+    若找到对应边界则写入 role_boundary 字段；否则置为 None。
+
+    Args:
+        skill_info: 技能信息字典，需包含 "name" 或 "skill_name" 键。
+
+    Returns:
+        原始字典（已就地补充 role_boundary 字段），便于链式调用。
+    """
+    skill_name = skill_info.get("name") or skill_info.get("skill_name")
+    skill_info["role_boundary"] = get_role_boundary(skill_name) if skill_name else None
+    return skill_info
+
+
+__all__ = ["DEV_WORKFLOW_SCHEMA", "enrich_skill_with_role_boundary", "get_role_boundary", "RoleBoundary"]

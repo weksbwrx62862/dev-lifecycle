@@ -29,30 +29,37 @@ _TOOLS = (
 
 def register(ctx) -> None:
     """Hermes 插件入口 — 注册工具和钩子。"""
+    if ctx is None or not hasattr(ctx, "register_tool"):
+        import logging
+        logging.getLogger(__name__).warning("dev_lifecycle: ctx 无效或缺少 register_tool 方法，跳过注册")
+        return
     global _plugin_ctx
     _plugin_ctx = ctx
-
     try:
-        from . import handlers as _h
-    except ImportError:
-        import handlers as _h
-    _h._plugin_ctx = ctx
+        try:
+            from . import handlers as _h
+        except ImportError:
+            import handlers as _h
+        _h._plugin_ctx = ctx
 
-    for name, schema, handler, emoji in _TOOLS:
-        ctx.register_tool(
-            name=name,
-            toolset="dev-lifecycle",
-            schema=schema,
-            handler=handler,
-            emoji=emoji,
-        )
+        for name, schema, handler, emoji in _TOOLS:
+            ctx.register_tool(
+                name=name,
+                toolset="dev-lifecycle",
+                schema=schema,
+                handler=handler,
+                emoji=emoji,
+            )
 
-    ctx.register_hook("on_session_start", handle_on_session_start)
+        ctx.register_hook("on_session_start", handle_on_session_start)
 
-    warmup_skill_cache()
+        warmup_skill_cache()
 
-    try:
-        from .handlers import init_modules
-    except ImportError:
-        from handlers import init_modules
-    init_modules()
+        try:
+            from .handlers import init_modules
+        except ImportError:
+            from handlers import init_modules
+        init_modules()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).exception("dev_lifecycle: register 失败: %s", e)

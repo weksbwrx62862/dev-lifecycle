@@ -10,20 +10,22 @@ import json
 import logging
 import os
 import re
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
 try:
-    from .state import WorkflowManager
-    from .gates import QualityGateManager
+    from .state import WorkflowManager, STAGE_ORDER
+    from .gates import QualityGateManager, get_role_boundary
     from .context import ProjectDetector, SkillRecommender
     from .telemetry import TelemetryRecorder, TelemetryEvent
     from .constants import LIFECYCLE, AUX_SKILLS
 except ImportError:
-    from state import WorkflowManager
-    from gates import QualityGateManager
+    from state import WorkflowManager, STAGE_ORDER
+    from gates import QualityGateManager, get_role_boundary
     from context import ProjectDetector, SkillRecommender
     from telemetry import TelemetryRecorder, TelemetryEvent
     from constants import LIFECYCLE, AUX_SKILLS
@@ -294,6 +296,9 @@ def handle_dev_workflow(args: Dict[str, Any], **kwargs) -> str:
             return _handle_resume(project_path)
         elif action == "report":
             return _handle_report()
+        elif action == "kanban":
+            project_path = args.get("project_path", "")
+            return _handle_kanban(project_path)
         else:
             return json.dumps({"error": f"未知 action: {action}"})
     except Exception as e:
@@ -395,6 +400,25 @@ def _handle_skill(name: str) -> str:
     if not exists:
         result["hint"] = "技能文件未找到，检查 ~/.hermes/skills/software-development/"
 
+    # 角色边界约束（软约束，借鉴 gstack 设计哲学，不强制阻断执行）
+    role_boundary = get_role_boundary(name)
+    if role_boundary:
+        result["role_boundary"] = {
+            "allowed": role_boundary.allowed,
+            "forbidden": role_boundary.forbidden,
+            "rationale": role_boundary.rationale,
+        }
+        boundary_hint = (
+            "角色边界约束（软约束，借鉴 gstack 设计，不强制阻断执行）：\n"
+            f"  允许：{', '.join(role_boundary.allowed)}\n"
+            f"  禁止：{', '.join(role_boundary.forbidden)}\n"
+            f"  理由：{role_boundary.rationale}"
+        )
+        if "hint" in result:
+            result["hint"] = result["hint"] + "\n\n" + boundary_hint
+        else:
+            result["hint"] = boundary_hint
+
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
@@ -447,6 +471,9 @@ def _handle_start(project_path: str) -> str:
             "frameworks": project_ctx.frameworks if project_ctx else [],
         } if project_ctx else None,
         "recommended_skills": [(s[0], s[1]) for s in recommended] if recommended else None,
+        "context_merge": {
+            "dev_stage": "ideate",
+        },
     }, ensure_ascii=False, indent=2)
 
 
@@ -465,7 +492,8 @@ def _handle_advance(skill_name: str) -> str:
         logger.warning("action=advance 时没有活跃的工作流")
         return json.dumps({"error": "没有活跃的工作流"}, ensure_ascii=False)
 
-    state = active[0]
+    # R46修复：当有多个活跃工作流时，按更新时间排序取最近的
+    state = sorted(active, key=lambda s: s.updated_at, reverse=True)[0]
     logger.info("推进技能: skill=%s, 当前阶段=%s, 项目=%s", skill_name, state.current_stage, state.project_path)
 
     workflow_id = _get_workflow_id(state.project_path)
@@ -473,30 +501,71 @@ def _handle_advance(skill_name: str) -> str:
         logger.error("无法获取工作流 ID: project_path=%s", state.project_path)
         return json.dumps({"error": "无法获取工作流 ID"}, ensure_ascii=False)
 
+    # 记录开始时间，用于计算遥测 duration
+    advance_start = time.time()
+
+    # 在 advance 之前检查门禁：判断完成该技能是否会触发阶段转换
+    from_stage = state.current_stage
+    stage_idx = STAGE_ORDER.index(from_stage) if from_stage in STAGE_ORDER else -1
+
+    if stage_idx >= 0 and stage_idx < len(STAGE_ORDER) - 1 and _gate_mgr:
+        # 查询 stage_skills_map，判断当前阶段是否即将完成
+        import sqlite3 as _sq3
+        try:
+            from .state import DB_PATH as _db_path
+        except ImportError:
+            from state import DB_PATH as _db_path
+        _conn = _sq3.connect(str(_db_path))
+        _row = _conn.execute("SELECT stage_skills_map FROM workflows WHERE id = ?", (workflow_id,)).fetchone()
+        _conn.close()
+        if _row:
+            _stage_skills_map = json.loads(_row[0])
+            _current_stage_skills = _stage_skills_map.get(from_stage, [])
+            # 检查完成 skill_name 后，当前阶段是否所有技能都已完成
+            _remaining = [
+                s for s in _current_stage_skills
+                if s != skill_name and state.skills_status.get(s) not in ("completed", "skipped")
+            ]
+            if not _remaining:
+                to_stage = STAGE_ORDER[stage_idx + 1]
+                gate_ctx = {
+                    "project_path": state.project_path,
+                    "current_stage": from_stage,
+                    "target_stage": to_stage,
+                }
+                gate_result = _gate_mgr.check(from_stage, to_stage, gate_ctx)
+                if gate_result.passed:
+                    logger.info("质量门禁通过: %s → %s", from_stage, to_stage)
+                else:
+                    logger.warning("质量门禁未通过: %s → %s, 失败项=%s, 建议=%s",
+                                   from_stage, to_stage, gate_result.failures, gate_result.suggestions)
+                    # 门禁未通过，不执行 advance
+                    return json.dumps({
+                        "skill_completed": skill_name,
+                        "current_stage": from_stage,
+                        "next_skill": None,
+                        "can_advance": False,
+                        "gate_check": {
+                            "passed": False,
+                            "failures": gate_result.failures,
+                            "suggestions": gate_result.suggestions,
+                        },
+                    }, ensure_ascii=False, indent=2)
+
     result = _workflow_mgr.advance(workflow_id, skill_name)
     logger.info("技能推进结果: completed=%s, current_stage=%s, next_skill=%s, can_advance=%s",
                 skill_name, result.get("current_stage"), result.get("next_skill"), result.get("can_advance"))
 
     if _telemetry:
+        duration = time.time() - advance_start
         project_ctx = _project_detector.detect(state.project_path) if _project_detector else None
         _telemetry.record(TelemetryEvent(
             skill_name=skill_name,
             stage=state.current_stage,
             project_type=project_ctx.project_type if project_ctx else "unknown",
+            duration=duration,
         ))
-        logger.debug("遥测已记录: skill=%s, stage=%s", skill_name, state.current_stage)
-
-    gate_result = None
-    if result.get("can_advance") and _gate_mgr:
-        from_stage = state.current_stage
-        to_stage = result.get("current_stage", from_stage)
-        if from_stage != to_stage:
-            gate_result = _gate_mgr.check(from_stage, to_stage, {})
-            if gate_result.passed:
-                logger.info("质量门禁通过: %s → %s", from_stage, to_stage)
-            else:
-                logger.warning("质量门禁未通过: %s → %s, 失败项=%s, 建议=%s",
-                               from_stage, to_stage, gate_result.failures, gate_result.suggestions)
+        logger.debug("遥测已记录: skill=%s, stage=%s, duration=%.3f", skill_name, state.current_stage, duration)
 
     response = {
         "skill_completed": skill_name,
@@ -504,12 +573,6 @@ def _handle_advance(skill_name: str) -> str:
         "next_skill": result.get("next_skill"),
         "can_advance": result.get("can_advance"),
     }
-    if gate_result and not gate_result.passed:
-        response["gate_check"] = {
-            "passed": False,
-            "failures": gate_result.failures,
-            "suggestions": gate_result.suggestions,
-        }
 
     ama_suggestion = None
     if result.get("can_advance") and result.get("current_stage") == "build" and _plugin_ctx is not None:
@@ -528,6 +591,20 @@ def _handle_advance(skill_name: str) -> str:
 
     if ama_suggestion:
         response["ama_suggestion"] = ama_suggestion
+
+    # 阶段变更时发布 context_merge 和 event
+    new_stage = result.get("current_stage")
+    if new_stage and new_stage != from_stage:
+        response["context_merge"] = {
+            "dev_stage": new_stage,
+            "dev_stage_prev": from_stage,
+        }
+        response["event"] = {
+            "type": "dev_stage_changed",
+            "from": from_stage,
+            "to": new_stage,
+        }
+        logger.info("阶段变更: %s → %s", from_stage, new_stage)
 
     return json.dumps(response, ensure_ascii=False, indent=2)
 
@@ -640,6 +717,45 @@ def _handle_report() -> str:
     return json.dumps(report, ensure_ascii=False, indent=2)
 
 
+def _handle_kanban(project_path: str = "") -> str:
+    """生成看板视图。"""
+    try:
+        from .kanban import create_dev_lifecycle_kanban, add_task_to_kanban, get_kanban_stats, render_kanban_html
+        
+        # 创建看板
+        board = create_dev_lifecycle_kanban("Hermes 项目")
+        
+        # 添加示例任务（实际应从项目状态加载）
+        add_task_to_kanban(board, "ideate", "req-1", "需求分析", "分析用户需求", "high", ["需求"])
+        add_task_to_kanban(board, "ideate", "plan-1", "架构设计", "设计系统架构", "medium", ["设计"])
+        add_task_to_kanban(board, "build", "impl-1", "代码实现", "实现核心功能", "high", ["开发"])
+        add_task_to_kanban(board, "build", "test-1", "单元测试", "编写单元测试", "medium", ["测试"])
+        add_task_to_kanban(board, "deliver", "deploy-1", "部署上线", "部署到生产环境", "critical", ["运维"])
+        
+        # 获取统计
+        stats = get_kanban_stats(board)
+        
+        # 生成 HTML
+        html = render_kanban_html(board)
+        kanban_path = f"/tmp/kanban_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+        with open(kanban_path, "w", encoding="utf-8") as f:
+            f.write(html)
+        
+        return json.dumps({
+            "success": True,
+            "kanban_path": kanban_path,
+            "stats": stats,
+            "message": f"看板已生成: {kanban_path}",
+        }, ensure_ascii=False, indent=2)
+        
+    except Exception as e:
+        logger.error("生成看板失败: %s", e)
+        return json.dumps({
+            "success": False,
+            "error": str(e),
+        }, ensure_ascii=False)
+
+
 def _get_workflow_id(project_path: str) -> Optional[int]:
     """根据 project_path 获取活跃工作流 ID。"""
     import sqlite3
@@ -699,8 +815,11 @@ def handle_on_session_start(**kwargs) -> None:
     except Exception as e:
         logger.warning("on_session_start: 检测工作流状态异常: %s", e)
 
-    try:
-        _plugin_ctx.inject_context(hint)
-        logger.info("on_session_start: 已注入生命周期上下文提示")
-    except Exception as e:
-        logger.warning("注入生命周期上下文提示失败: %s", e)
+    if hasattr(_plugin_ctx, "inject_context"):
+        try:
+            _plugin_ctx.inject_context(hint)
+            logger.info("on_session_start: 已注入生命周期上下文提示")
+        except Exception as e:
+            logger.warning("注入生命周期上下文提示失败: %s", e)
+    else:
+        logger.debug("on_session_start: PluginContext 无 inject_context 方法，跳过上下文注入（正常行为，当前版本不支持）")

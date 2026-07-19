@@ -1,18 +1,8 @@
 __pycache__/
-*.py[cod]
-*.so
-dist/
+*.pyc
+.coverage
 *.egg-info/
-.venv/
-venv/
-.vscode/
-.idea/
-.DS_Store
-Thumbs.db
-*.db
-*.sqlite*
-.pytest_cache/
-.mypy_cache/
-.trae/
-# Claude Code local config
-.claude/
+dist/
+build/
+.env
+

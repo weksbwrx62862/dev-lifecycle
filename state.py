@@ -177,6 +177,10 @@ class WorkflowManager:
                     next_skill = next_stage_skills[0] if next_stage_skills else None
                     state.current_stage = next_stage
                     state.updated_at = now
+                elif state.current_stage == STAGE_ORDER[-1]:
+                    # deliver 阶段所有技能完成，自动转为 complete 状态
+                    state.current_stage = "complete"
+                    state.updated_at = now
 
             cursor.execute(
                 "UPDATE workflows SET current_stage = ?, skills_status = ?, updated_at = ? WHERE id = ?",
