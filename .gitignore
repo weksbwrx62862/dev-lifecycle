@@ -6,3 +6,6 @@ dist/
 build/
 .env
 
+# Trae agent files (local only)
+.trae/
+
